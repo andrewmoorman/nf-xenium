@@ -386,6 +386,7 @@ class Level:
         Custom indexing for arbitrary numbers of pyramidal levels and arbitrary
         orderings of dimensions in file formats.
         """
+        item = item if isinstance(item, list) else list(item)
         index = dict(zip(list(self.axes), item))
         return self.slide_image._get_slice(self.level, **index)
 

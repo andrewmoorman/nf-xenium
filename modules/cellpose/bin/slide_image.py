@@ -6,6 +6,7 @@ import tifffile
 import zarr
 import numpy as np
 from collections import defaultdict, OrderedDict
+import re
 
 
 _valid_image_formats = dict()
@@ -128,6 +129,37 @@ class SlideImage(ABC):
         """
         return tuple(self._shapes[level].values())
 
+    @abstractmethod
+    def _get_level_dtype(self, level: int) -> np.dtype:
+        """
+        Helper function for data type by pyramidal level.
+        Returns e.g., dtype('uint16') for a 16-bit integer array
+        """
+        pass
+
+    def select_level(
+        self,
+        max_mem: typing.Union[int, str],
+        by_dims: tuple[str] = None,
+    ):
+        # Convert max memory argument from string (e.g., '10GB') to int
+        units = {"B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12}
+        def parse_size(size):
+            size = size.upper()
+            if not re.match(r' ', size):
+                size = re.sub(r'([KMGT]?B)', r' \1', size)
+            number, unit = [string.strip() for string in size.split()]
+            return int(float(number)*units[unit])
+        if isinstance(max_mem, str):
+            max_mem = parse_size(max_mem)
+
+        for level in self.levels:
+            level.shape
+            
+            dtype = level.dtype.itemsize
+        
+
+
     @property
     def levels(self):
         """
@@ -209,7 +241,7 @@ class TIFFSlideImage(SlideImage):
         """
         index = defaultdict(lambda: slice(None))
         index.update(kwargs)
-        assert self._validate_slice(index)
+        #assert self._validate_slice(index)
         store = tifffile.imread(
             self._file_path,
             aszarr=True,
@@ -218,6 +250,14 @@ class TIFFSlideImage(SlideImage):
         z = zarr.open(store)
         slices = tuple(index[ax] for ax in self._get_level_order(level))
         return z[slices]
+
+    def _get_level_dtype(self, level: int) -> np.dtype:
+        """
+        Helper function for data type by pyramidal level.
+        Returns e.g., dtype('uint16') for a 16-bit integer array
+        """
+        with tifffile.TiffFile(self._file_path, mode='r') as f:
+            return f.series[0].levels[level].dtype
 
 '''
 # Concrete creator for .nd2 files
@@ -277,6 +317,13 @@ class Level:
     def __init__(self, slide_image : SlideImage, level : int) -> None:
         self.slide_image = slide_image
         self.level = level
+
+    @property
+    def dtype(self) -> np.dtype:
+        """
+        Getter for parent property
+        """
+        return self.slide_image._get_level_dtype(self.level)
     
     @property
     def axes(self) -> str:

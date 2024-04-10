@@ -73,6 +73,7 @@ def align_sift(
     channel_fxd: int,
     channel_mvg: int,
     path_out: typing.Union[str, os.PathLike],
+    **kwargs,
 ):
     """
     Align an "moving" image to a "fixed" reference image using:
@@ -98,16 +99,26 @@ def align_sift(
     img_fxd = get_slide_image(path_fxd)
     img_mvg = get_slide_image(path_mvg)
 
+    if 'max_mem' in kwargs:
+        lvl_fxd = img_fxd.select_level(kwargs['max_mem'], 'XY')
+        lvl_mvg = img_mvg.select_level(kwargs['max_mem'], 'XY')
+    else:
+        lvl_fxd = img_fxd.levels[0]
+        lvl_mvg = img_mvg.levels[0]
+
+
     # Get homography matrix of moving to fixed images
     M = _get_sift_homography(
-        img_fxd=img_fxd._get_slice(C=channel_fxd),
-        img_mvg=img_mvg._get_slice(C=channel_mvg),
+        img_fxd=lvl_fxd.get_slice(C=channel_fxd),
+        img_mvg=lvl_mvg.get_slice(C=channel_mvg),
     )
-
+    return M
+    '''
     # Transform moving image to match fixed image
     dim = img_fxd[channel_fxd].shape[::-1]
     img_wrp = np.stack(
         [cv2.warpPerspective(img, M, dim) for img in img_mvg]  # each channel
     )
     # TODO: save output as .tiff file
-    np.save(path_out, img_wrp)
+    return M
+    '''

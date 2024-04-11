@@ -316,7 +316,6 @@ class TIFFSlideImage(SlideImage):
         Helper function for getting the ordering of axes by pyramidal level.
         Returns e.g., 'XYZC' for 4d array with X, Y, Z, C axes.
         """
-        print(level)
         with tifffile.TiffFile(self._file_path, mode='r') as f:
             return f.series[0].levels[level].shape
 

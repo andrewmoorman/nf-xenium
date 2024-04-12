@@ -7,6 +7,7 @@ import zarr
 import numpy as np
 from collections import defaultdict, OrderedDict
 import re
+from xml.etree import ElementTree
 
 
 _valid_image_formats = dict()
@@ -60,6 +61,7 @@ class SlideImage(ABC):
         # '_levels' is a helper param to enable more convenient indexing of 
         # pyramidal files through a 'img.levels[level]' pattern
         self._set_levels()
+        assert len(self._levels) > 0
 
     @abstractmethod
     def _set_levels(self) -> list:
@@ -179,8 +181,9 @@ class SlideImage(ABC):
             if n_bytes <= max_mem:
                 return level
         msg = (
-            f"No level found matching memory request of {max_mem} for "
-            f"dimensions {''.join(list(by_dims))}"
+            f"No level found matching memory request of {max_mem}B for "
+            f"dimensions {''.join(list(by_dims))}. Smallest level size is "
+            f"{n_bytes}B"
         )
         raise ValueError(msg)
 
@@ -208,7 +211,25 @@ class SlideImage(ABC):
         By default, references the 0th pyramidal level.
         """
         return self._levels[0].shape
+
+    @property
+    def dtype(self) -> np.dtype:
+        """
+        Helper function for getting the numpy data type of the pyramidal level.
+        Returns e.g., np.dtype('uint16') for 16-bit int array
+        By default, references the 0th pyramidal level.
+        """
+        return self._levels[0].dtype
     
+    @property
+    def channels(self) -> list[str]:
+        """
+        Helper function for getting the numpy data type of the pyramidal level.
+        Returns e.g., np.dtype('uint16') for 16-bit int array
+        By default, references the 0th pyramidal level.
+        """
+        return self._levels[0].channels
+
     # Decorator to check level values across all
     @staticmethod
     def _check_level(fn):
@@ -295,8 +316,8 @@ class TIFFSlideImage(SlideImage):
     @_check_level
     def _get_level_dtype(self, level: int) -> np.dtype:
         """
-        Helper function for getting the ordering of axes by pyramidal level.
-        Returns e.g., 'XYZC' for 4d array with X, Y, Z, C axes.
+        Helper function for getting the numpy data type of the pyramidal level.
+        Returns e.g., np.dtype('uint16') for 16-bit int array
         """
         with tifffile.TiffFile(self._file_path, mode='r') as f:
             return f.series[0].levels[level].dtype
@@ -305,7 +326,7 @@ class TIFFSlideImage(SlideImage):
     def _get_level_axes(self, level: int) -> str:
         """
         Helper function for getting the ordering of axes by pyramidal level.
-        Returns e.g., 'XYZC' for 4d array with X, Y, Z, C axes.
+        Returns e.g., 'XYZC' for 4d array with X, Y, Z, C axes
         """
         with tifffile.TiffFile(self._file_path, mode='r') as f:
             return f.series[0].levels[level].axes
@@ -314,12 +335,27 @@ class TIFFSlideImage(SlideImage):
     def _get_level_shape(self, level: int) -> str:
         """
         Helper function for getting the ordering of axes by pyramidal level.
-        Returns e.g., 'XYZC' for 4d array with X, Y, Z, C axes.
+        Returns e.g., 'XYZC' for 4d array with X, Y, Z, C axes
         """
         with tifffile.TiffFile(self._file_path, mode='r') as f:
             return f.series[0].levels[level].shape
+    
+    @_check_level
+    def _get_level_channels(self, level: int) -> list[str]:
+        """
+        Helper function for getting the channel names by pyramidal level.
+        Where no channel names exist, returns an empty list.
+        """
+        with tifffile.TiffFile(self._file_path) as f:
+            if f.is_ome:
+                tree = ElementTree.fromstring(f.ome_metadata)
+                prefix = tree.tag.rstrip('OME')
+                channels = tree.findall(f".//{prefix}Channel")
+                return [c.attrib['Name'] for c in channels]
+            else:
+                return []
 
-'''
+
 # Concrete creator for .nd2 files
 # TODO: No good solution for working with .nd2 files which is memory-efficient
 # and fast, so loading full image to memory for now
@@ -369,24 +405,17 @@ class ND2SlideImage(SlideImage):
         """
         index = defaultdict(lambda: slice(None))
         index.update(kwargs)
-        #assert self._validate_slice(index)
-        store = tifffile.imread(
-            self._file_path,
-            aszarr=True,
-            level=level,
-        )
-        z = zarr.open(store)
-        slices = tuple(index[ax] for ax in self._get_level_order(level))
-        return z[slices]
+        slices = tuple(index[ax] for ax in self._get_level_axes(level))
+        return self._img[slices]
 
     @_check_level
     def _get_level_dtype(self, level: int) -> np.dtype:
         """
-        Helper function for getting the ordering of axes by pyramidal level.
-        Returns e.g., 'XYZC' for 4d array with X, Y, Z, C axes.
+        Helper function for getting the numpy data type of the pyramidal level.
+        Returns e.g., np.dtype('uint16') for 16-bit int array
         """
-        with tifffile.TiffFile(self._file_path, mode='r') as f:
-            return f.series[0].levels[level].dtype
+        with nd2.ND2File(self._file_path) as f:
+            return f.dtype
 
     @_check_level
     def _get_level_axes(self, level: int) -> str:
@@ -394,53 +423,31 @@ class ND2SlideImage(SlideImage):
         Helper function for getting the ordering of axes by pyramidal level.
         Returns e.g., 'XYZC' for 4d array with X, Y, Z, C axes.
         """
-        with tifffile.TiffFile(self._file_path, mode='r') as f:
-            return f.series[0].levels[level].dims
+        with nd2.ND2File(self._file_path) as f:
+            return ''.join(f.sizes.keys())
 
     @_check_level
     def _get_level_shape(self, level: int) -> str:
         """
-        Helper function for getting the ordering of axes by pyramidal level.
-        Returns e.g., 'XYZC' for 4d array with X, Y, Z, C axes.
+        Dimensional sizes, e.g., (1000, 1000, 10, 3) for 4d array with shape 
+        1000 x 1000 x 10 x 3.
         """
-        with tifffile.TiffFile(self._file_path, mode='r') as f:
-            return f.series[0].levels[level].shape
-
-    def __init__(self, file_path):
-        super().__init__(file_path)
-        # Initialize nd2 object as ndarray
-        
-        # Set length, layer size(s), etc.
-        self._set_metadata()
-
-    def _set_metadata(self):
-        # Implementation for extracting metadata from .nd2 files
-        
         with nd2.ND2File(self._file_path) as f:
-            self.size = f.size
-            self.channels = f._channel_names
-            self.shape = f.shape
-            self.mpp = f.voxel_size()
+            return f.shape
 
-    def __getitem__(self, key):
-        # Implementation for slicing .nd2 images
-        return self._img[key]
-'''
-'''
-# TODO: Concrete creator for .mrxs files
-class MRXSSlideImage(SlideImage):
-    def __init__(self, file_path):
-        super().__init__(file_path)
-        # Initialize mirax file object
-
-    def get_metadata(self):
-        # Implementation for extracting metadata from .mrxs files
-        pass
-
-    def get_slice(self):
-        # Implementation for slicing .mrxs images
-        pass
-'''
+    @_check_level
+    def _get_level_channels(self, level: int) -> list[str]:
+        """
+        Helper function for getting the channel names by pyramidal level.
+        Where no channel names exist, returns an empty list.
+        """
+        with nd2.ND2File(self._file_path) as f:
+            try:
+                channels = f.metadata.channels
+            except AttributeError:
+                return []
+            channels.sort(key = lambda c: c.channel.index)
+            return [c.channel.name for c in channels]
 
 
 class Level:
@@ -479,7 +486,14 @@ class Level:
         Getter for parent property
         """
         return self.slide_image._get_level_shape(self.level)
-    
+
+    @property
+    def channels(self) -> list[str]:
+        """
+        Getter for parent property
+        """
+        return self.slide_image._get_level_channels(self.level)
+
     def get_slice(self, **kwargs) -> np.array:
         """
         Wrapper for parent method

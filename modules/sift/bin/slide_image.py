@@ -1,13 +1,14 @@
 from abc import ABC, abstractmethod
-import typing
-import os
 import nd2
 import tifffile
 import zarr
+import cv2
 import numpy as np
 from collections import defaultdict, OrderedDict
 import re
 from xml.etree import ElementTree
+import typing
+import os
 
 
 _valid_image_formats = dict()
@@ -60,11 +61,12 @@ class SlideImage(ABC):
         
         # '_levels' is a helper param to enable more convenient indexing of 
         # pyramidal files through a 'img.levels[level]' pattern
-        self._set_levels()
+        # Levels wraps list class with a custom index error
+        self._levels = Levels(self._get_levels())
         assert len(self._levels) > 0
 
     @abstractmethod
-    def _set_levels(self) -> list:
+    def _get_levels(self) -> list:
         """
         Creates a list of 'levels' whose indices are the order of pyramidal
         levels, where 0 is the largest or bottom level.
@@ -187,6 +189,113 @@ class SlideImage(ABC):
         )
         raise ValueError(msg)
 
+    # TODO: Implement more comprehensive metadata collection before saving
+    def write_ome_tiff(
+        self,
+        file_path: typing.Union[str, os.PathLike] = None,
+        subresolutions: int = 0,
+    ) -> None:
+        """
+        Write a multi-level, pyramidal OME-TIFF file with minimal metadata to 
+        the provided file path
+
+        Each pyramidal level is a downsampling of the full-resolution plane in
+        the X and Y dimensions and the resolution is unchanged in the other
+        dimensions. Levels are created with a fixed downsampling factor of 2
+        for each level in 'subresolutions'
+
+        More info on OME-TIFF file format can be found here:
+        https://docs.openmicroscopy.org/ome-model/6.3.1/ome-tiff/specification.html
+
+        Parameters
+        ----------
+        file_path : typing.Union[str, os.PathLike], optional
+            Path to write new OME-TIFF. If None, writes a .ome.tif file to the
+            same directory as 'self._file_path', by default None
+        subresolutions : int, optional
+            Number of downsampled levels to write, by default 0
+
+        Raises
+        ------
+        ValueError
+            If provided the wrong file extension in 'file_path'
+        ValueError
+            If axes cannot be coerced into a pyramidal format
+        """
+        # Destination filepath handling
+        if file_path is None:
+            if self._file_path.endswith('.ome.tif'):
+                file_path = self._file_path
+            else:
+                file_path, extension = os.path.splitext(self._file_path)
+                file_path += '.ome.tif'
+        elif not file_path.endswith('.ome.tif'):
+            msg = (
+                f"File path '{file_path}' does end with the extension "
+                "'.ome.tif'"
+            )
+            raise ValueError(msg)
+
+        # Rearrange array; generally, YX should be last
+        default_order = 'SCZYX'
+        order = list(filter(lambda c: c in self.axes, default_order))
+        if len(self.axes) != len(order):
+            msg = (
+                "Can't save .ome.tif due to unrecognized labeled axes: "
+                f"{', '.join(set(self.axes).difference(order))}"
+            )
+            raise ValueError(msg)
+        if not order[-2:] != ['Y','X']:
+            msg = f"Last two axes of image are {''.join(order[-2:])}, not YX"
+            raise ValueError(msg)
+        img = np.moveaxis(
+            self[:],
+            [self.axes.index(i) for i in order],
+            range(len(order)),
+        )
+
+        # Write multi-level Tiff
+        # TODO: function for getting mpp
+        metadata = {
+            'Axes': order,
+            'PhysicalSizeX': self.mpp['X'],
+            'PhysicalSizeXUnit': "µm",
+            'PhysicalSizeY': self.mpp['Y'],
+            'PhysicalSizeYUnit': "µm",
+            'Channel': {'Name': self.channels},
+        }
+        with tifffile.TiffWriter(file_path,  bigtiff=True) as writer:
+            # Pyramid level 0
+            resolution = np.array([1e4 / self.mpp['X']] * 2)
+            kwargs = dict(
+                photometric='rgb' if len(self.channels)==3 else 'minisblack',
+                tile=(1024, 1024),
+                dtype=self.dtype,
+                compression='jpeg2000',
+                resolutionunit='CENTIMETER'
+            )
+            writer.write(
+                img,
+                subifds=subresolutions,
+                resolution=resolution,
+                metadata=metadata,
+                **kwargs,
+            )
+            # All other pyramidal sub-resolutions
+            for i in range(1, subresolutions+1):
+                sub_img = cv2.resize(
+                    img,
+                    fx=2**-i,
+                    fy=2**-i,
+                    interpolation=cv2.INTER_AREA,
+                )
+                writer.write(
+                    sub_img,
+                    subfiletype=1,
+                    resolution=resolution * 2**-i,
+                    **kwargs,
+                )
+
     @property
     def levels(self):
         """
@@ -230,18 +339,14 @@ class SlideImage(ABC):
         """
         return self._levels[0].channels
 
-    # Decorator to check level values across all
-    @staticmethod
-    def _check_level(fn):
-        def wrapper(self, *args, **kwargs):
-            named_args = dict(zip(fn.__code__.co_varnames[1:], args))
-            named_args.update(kwargs)
-            level = named_args['level']
-            if len(self._levels) <= level:
-                msg = f"User-provided level '{level}' does not exist"
-                raise ValueError(msg)
-            return fn(self, *args, **kwargs)
-        return wrapper
+    @property
+    def mpp(self) -> dict[str, float]:
+        """
+        Helper function for getting the microns per pixel for X/Y image axes.
+        Returns e.g., {'X': 0.2137, 'Y': 0.2137} for an square aspect image
+        with 0.2317 microns per pixel.
+        """
+        return self._levels[0].mpp
 
 
 @_register_image_format(['.tif', '.tiff'])
@@ -254,9 +359,8 @@ class TIFFSlideImage(SlideImage):
     file_path : str
         Path to a valid Tiff file
     """
-    _check_level = SlideImage._check_level
 
-    def _set_levels(self):
+    def _get_levels(self):
         """
         Creates a list of 'levels' objects corresponding to pyramidal levels in
         Tiff
@@ -275,12 +379,12 @@ class TIFFSlideImage(SlideImage):
                 )
                 raise NotImplementedError(msg)
             else:
-                self._levels = [
+                return [
                     Level(slide_image=self, level=i)
                     for i in range(len(f.series[0].levels))
                 ]
 
-    @_check_level
+
     def _get_slice(
         self,
         level: int = 0,
@@ -313,7 +417,6 @@ class TIFFSlideImage(SlideImage):
         slices = tuple(index[ax] for ax in self._get_level_axes(level))
         return z[slices]
 
-    @_check_level
     def _get_level_dtype(self, level: int) -> np.dtype:
         """
         Helper function for getting the numpy data type of the pyramidal level.
@@ -322,7 +425,6 @@ class TIFFSlideImage(SlideImage):
         with tifffile.TiffFile(self._file_path, mode='r') as f:
             return f.series[0].levels[level].dtype
 
-    @_check_level
     def _get_level_axes(self, level: int) -> str:
         """
         Helper function for getting the ordering of axes by pyramidal level.
@@ -331,7 +433,6 @@ class TIFFSlideImage(SlideImage):
         with tifffile.TiffFile(self._file_path, mode='r') as f:
             return f.series[0].levels[level].axes
 
-    @_check_level
     def _get_level_shape(self, level: int) -> str:
         """
         Helper function for getting the ordering of axes by pyramidal level.
@@ -339,8 +440,7 @@ class TIFFSlideImage(SlideImage):
         """
         with tifffile.TiffFile(self._file_path, mode='r') as f:
             return f.series[0].levels[level].shape
-    
-    @_check_level
+
     def _get_level_channels(self, level: int) -> list[str]:
         """
         Helper function for getting the channel names by pyramidal level.
@@ -370,19 +470,16 @@ class ND2SlideImage(SlideImage):
         Path to a valid nd2 file
     """
 
-    _check_level = SlideImage._check_level
-
     def __init__(self, file_path):
         super().__init__(file_path)
         self._img = nd2.imread(self._file_path)
 
-    def _set_levels(self):
+    def _get_levels(self):
         """
         ND2 files can only contain one level
         """
-        self._levels = [Level(slide_image=self, level=0)]
+        return [Level(slide_image=self, level=0)]
 
-    @_check_level
     def _get_slice(
         self,
         level: int = 0,
@@ -408,7 +505,6 @@ class ND2SlideImage(SlideImage):
         slices = tuple(index[ax] for ax in self._get_level_axes(level))
         return self._img[slices]
 
-    @_check_level
     def _get_level_dtype(self, level: int) -> np.dtype:
         """
         Helper function for getting the numpy data type of the pyramidal level.
@@ -417,7 +513,6 @@ class ND2SlideImage(SlideImage):
         with nd2.ND2File(self._file_path) as f:
             return f.dtype
 
-    @_check_level
     def _get_level_axes(self, level: int) -> str:
         """
         Helper function for getting the ordering of axes by pyramidal level.
@@ -426,7 +521,6 @@ class ND2SlideImage(SlideImage):
         with nd2.ND2File(self._file_path) as f:
             return ''.join(f.sizes.keys())
 
-    @_check_level
     def _get_level_shape(self, level: int) -> str:
         """
         Dimensional sizes, e.g., (1000, 1000, 10, 3) for 4d array with shape 
@@ -435,7 +529,6 @@ class ND2SlideImage(SlideImage):
         with nd2.ND2File(self._file_path) as f:
             return f.shape
 
-    @_check_level
     def _get_level_channels(self, level: int) -> list[str]:
         """
         Helper function for getting the channel names by pyramidal level.
@@ -466,33 +559,15 @@ class Level:
         self.slide_image = slide_image
         self.level = level
 
-    @property
-    def dtype(self) -> np.dtype:
+    def __getattr__(self, name):
         """
         Getter for parent property
         """
-        return self.slide_image._get_level_dtype(self.level)
-    
-    @property
-    def axes(self) -> str:
-        """
-        Getter for parent property
-        """
-        return self.slide_image._get_level_axes(self.level)
-    
-    @property
-    def shape(self) -> tuple[int]:
-        """
-        Getter for parent property
-        """
-        return self.slide_image._get_level_shape(self.level)
-
-    @property
-    def channels(self) -> list[str]:
-        """
-        Getter for parent property
-        """
-        return self.slide_image._get_level_channels(self.level)
+        fn = f'_get_level_{name}'
+        if hasattr(self.slide_image, fn):
+                self.slide_image.__getattribute__(fn)(self.level)
+        else:
+            raise AttributeError
 
     def get_slice(self, **kwargs) -> np.array:
         """
@@ -511,6 +586,18 @@ class Level:
             item = [item]
         index = dict(zip(list(self.axes), item))
         return self.slide_image._get_slice(self.level, **index)
+
+
+class Levels(list):
+    """
+    Extends list class with custom IndexError
+    """
+    def __getitem__(self, index):
+        try:
+            return super.__getitem__(index)
+        except IndexError:
+            msg = f"Level {index} does not exist in SlideImage"
+            raise IndexError(msg)
 
 
 # Factory method
